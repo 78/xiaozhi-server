@@ -1,112 +1,124 @@
 // terrence@tenclass.com
 // 2024-08-27
-// 大模型语音合成双向流式API
+// 大模型语音合成双向流式 API
 // (https://www.volcengine.com/docs/6561/1329505)
 
 require('dotenv').config();
 const { WebSocket } = require('ws');
 const { v4: uuidv4 } = require('uuid');
-const Emitter = require('events');
+const EventEmitter = require('events');
+const config = require('../config');
 
-
-class TtsSession extends Emitter {
+class TtsSession extends EventEmitter {
   constructor(client, speaker) {
     super();
     this.client = client;
     this.sessionId = uuidv4();
-    this.params = {
-      speaker,
+    this.params = this.initParams(speaker);
+  }
+
+  initParams(speaker) {
+    return {
+      speaker: speaker || 'zh_female_shuangkuaisisi_moon_bigtts',
       audio_params: {
         format: 'pcm',
-        sample_rate: 16000
+        sample_rate: 24000
       }
     };
   }
 
   start() {
-    const payload = {
-      namespace: 'BidirectionalTTS',
-      event: 100,
-      req_params: {
-        ...this.params
-      }
-    };
-    this.client.sendFullClientRequest(payload.event, payload, this.sessionId);
+    this.sendRequest(100, { ...this.params });
   }
 
   write(text) {
-    const payload = {
-      namespace: 'BidirectionalTTS',
-      event: 200,
-      req_params: {
-        ...this.params,
-      }
-    };
-    payload.req_params.text = text;
-    this.client.sendFullClientRequest(payload.event, payload, this.sessionId);
+    this.sendRequest(200, { ...this.params, text });
   }
 
   finish() {
-    const payload = {};
-    this.client.sendFullClientRequest(102, payload, this.sessionId);
+    this.sendRequest(102, {});
+  }
+
+  sendRequest(event, reqParams) {
+    const payload = {
+      namespace: 'BidirectionalTTS',
+      event,
+      req_params: reqParams
+    };
+    this.client.sendFullClientRequest(event, payload, this.sessionId);
   }
 }
 
-class TtsClient extends Emitter {
+class TtsClient extends EventEmitter {
   constructor() {
     super();
-    this.sessions = {};
+    this.sessions = new Map();
     this.reqId = uuidv4();
-    this.socket = new WebSocket('wss://openspeech.bytedance.com/api/v3/tts/bidirection', {
-      headers: {
-        'X-Api-App-Key': process.env.BYTEDANCE_TTS_APP_ID,
-        'X-Api-Access-Key': process.env.BYTEDANCE_TTS_APP_KEY,
-        'X-Api-Resource-Id': 'volc.service_type.10029',
-        'X-Api-Request-Id': this.reqId
-      }
+    this.initWebSocket();
+    console.log('reqId', this.reqId);
+  }
+
+  initWebSocket() {
+    this.socket = new WebSocket(config.ttsWebSocketUrl, {
+      headers: this.getHeaders()
     });
 
-    this.socket.on('open', () => {
-      this.sendFullClientRequest(1, {});
-    });
+    this.socket.on('open', this.onOpen.bind(this));
+    this.socket.on('message', this.onMessage.bind(this));
+    this.socket.on('error', this.onError.bind(this));
+    this.socket.on('close', this.onClose.bind(this));
+    this.socket.on('upgrade', this.onUpgrade.bind(this));
+  }
 
-    this.socket.on('message', (data) => {
-      this.handleServerResponse(data);
-    });
+  onUpgrade(req) {
+    console.log('TTS LogId', req.headers['x-tt-logid']);
+  }
 
-    this.socket.on('error', (err) => {
-      console.error('WebSocket error:', err);
-      this.emit('error', err);
-    });
+  getHeaders() {
+    return {
+      'X-Api-App-Key': process.env.BYTEDANCE_TTS_APP_ID,
+      'X-Api-Access-Key': process.env.BYTEDANCE_TTS_APP_KEY,
+      'X-Api-Resource-Id': 'volc.service_type.10029',
+      'X-Api-Request-Id': this.reqId
+    };
+  }
 
-    this.socket.on('close', () => {
-      console.log('WebSocket closed.');
-      for (const session of Object.values(this.sessions)) {
-        session.emit('cancelled');
-      }
-      this.emit('close');
-    });
+  onOpen() {
+    this.sendFullClientRequest(1, {});
+  }
+
+  onMessage(data) {
+    const messageType = data.readUInt8(1);
+    const handlers = {
+      0xF0: this.parseErrorResponse,
+      0x94: this.parseFullServerResponse,
+      0xB4: this.parseAudioResponse
+    };
+
+    const handler = handlers[messageType];
+    if (handler) {
+      handler.call(this, data);
+    } else {
+      console.error('Unknown message type:', messageType, data.toString());
+    }
+  }
+
+  onError(err) {
+    console.error('WebSocket error:', err);
+    this.emit('error', err);
+  }
+
+  onClose() {
+    this.sessions.forEach(session => session.emit('cancelled'));
+    this.sessions.clear();
+    this.emit('close');
   }
 
   newSession(speaker) {
-    const session = new TtsSession(this, speaker || 'zh_female_shuangkuaisisi_moon_bigtts');
-    this.sessions[session.sessionId] = session;
+    const session = new TtsSession(this, speaker);
+    this.sessions.set(session.sessionId, session);
     session.start();
     return session;
-  }
-
-  handleServerResponse(data) {
-    // Get the second byte: message type
-    const messageType = data.readUInt8(1);
-    if (messageType == 0xF0) {
-      this.parseErrorResponse(data);
-    } else if (messageType == 0x94) {
-      this.parseFullServerResponse(data);
-    } else if (messageType == 0xB4) {
-      this.parseAudioResponse(data);
-    } else {
-      console.error('Unknown message type:', messageType);
-    }
   }
 
   parseErrorResponse(data) {
@@ -124,69 +136,80 @@ class TtsClient extends Emitter {
     const payloadLengthBuffer = Buffer.alloc(4);
     payloadLengthBuffer.writeUInt32BE(payloadBuffer.length);
 
+    let fullRequest;
     if (sessionId) {
       const sessionIdBuffer = Buffer.alloc(4 + sessionId.length);
       sessionIdBuffer.writeUInt32BE(sessionId.length);
       sessionIdBuffer.write(sessionId, 4);
-      const fullRequest = Buffer.concat([header, optional,
-        sessionIdBuffer, payloadLengthBuffer, payloadBuffer]);
-      this.socket.send(fullRequest);
+      fullRequest = Buffer.concat([header, optional, sessionIdBuffer, payloadLengthBuffer, payloadBuffer]);
     } else {
-      const fullRequest = Buffer.concat([header, optional, payloadLengthBuffer, payloadBuffer]);
-      this.socket.send(fullRequest);
+      fullRequest = Buffer.concat([header, optional, payloadLengthBuffer, payloadBuffer]);
     }
+
+    this.socket.send(fullRequest);
   }
 
   parseFullServerResponse(data) {
     const eventCode = data.readUInt32BE(4);
-    if (eventCode == 50) {
-      this.connectionReady = true;
-      this.emit('ready');
-    } else if (eventCode == 51) {
-      this.connectionReady = false;
-      this.emit('error', 'Failed to connect to TTS server.');
-    } else if (eventCode == 52) {
-      this.socket.close();
-      this.emit('close');
+    if (eventCode <= 52) {
+      this.handleConnectionEvents(eventCode);
     } else {
-      let offset = 8;
-      const sessionIdLength = data.readUInt32BE(offset);
-      offset += 4;
-      const sessionId = data.toString('utf8', offset, offset + sessionIdLength);
-      offset += sessionIdLength;
-      const payloadLength = data.readUInt32BE(offset);
-      offset += 4;
-      const payload = JSON.parse(data.toString('utf8', offset, offset + payloadLength));
-      const session = this.sessions[sessionId];
-      if (!session) {
-        console.error('parseFullServerResponse: Session not found:', sessionId);
-        return;
-      }
-      
-      switch (eventCode) {
-      case 150:
-        session.emit('started');
+      this.handleSessionEvents(data, eventCode);
+    }
+  }
+
+  handleConnectionEvents(eventCode) {
+    switch (eventCode) {
+      case 50:
+        this.connectionReady = true;
+        this.emit('ready');
         break;
-      case 151:
+      case 51:
+        this.connectionReady = false;
+        this.emit('error', 'Failed to connect to TTS server.');
+        break;
+      case 52:
+        this.socket.close();
+        break;
+    }
+  }
+
+  handleSessionEvents(data, eventCode) {
+    let offset = 8;
+    const sessionIdLength = data.readUInt32BE(offset);
+    offset += 4;
+    const sessionId = data.toString('utf8', offset, offset + sessionIdLength);
+    offset += sessionIdLength;
+    const payloadLength = data.readUInt32BE(offset);
+    offset += 4;
+    const payload = JSON.parse(data.toString('utf8', offset, offset + payloadLength));
+
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      console.error('Session not found:', sessionId);
+      return;
+    }
+
+    const eventHandlers = {
+      150: () => session.emit('started'),
+      151: () => {
         session.emit('cancelled');
-        delete this.sessions[sessionId];
-        break;
-      case 152:
+        this.sessions.delete(sessionId);
+      },
+      152: () => {
         session.emit('finished');
-        delete this.sessions[sessionId];
-        break;
-      case 153:
-        session.emit('error', payload);
-        break;
-      case 350:
-        session.emit('sentence_start', payload.text);
-        break;
-      case 351:
-        session.emit('sentence_end', payload.text);
-        break;
-      default:
-        console.error('Unknown event code:', eventCode);
-      }
+        this.sessions.delete(sessionId);
+      },
+      153: () => session.emit('error', payload),
+      350: () => session.emit('sentence_start', payload.text),
+      351: () => session.emit('sentence_end', payload.text)
+    };
+
+    const handler = eventHandlers[eventCode];
+    if (handler) {
+      handler();
+    } else {
+      console.error('Unknown event code:', eventCode);
     }
   }
 
@@ -200,53 +223,76 @@ class TtsClient extends Emitter {
     offset += 4;
     const audio = data.slice(offset, offset + audioLength);
     
-    const session = this.sessions[sessionId];
-    if (!session) {
-      console.error('parseAudioResponse: Session not found:', sessionId);
-      return;
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      session.emit('audio', audio);
+    } else {
+      console.error('Session not found:', sessionId);
     }
-    session.emit('audio', audio);
   }
 
   finishConnection() {
     this.sendFullClientRequest(2, {});
   }
-};
 
+  static test() {
+    const client = new TtsClient();
+    client.on('ready', () => {
+      console.log('TTS服务器就绪。');
 
-function test() {
-  const tts = new TtsClient();
-  tts.on('ready', () => {
-    console.log(new Date(), 'TTS server is ready.');
+      const session = client.newSession();
+      session.on('started', async () => {
+        console.log('TTS会话已开始。');
 
-    const session = tts.newSession();
-    session.on('started', async () => {
-      console.log(new Date(), 'TTS session started.');
+        session.write('你好');
+        session.finish();
+      });
 
-      session.write('你好，主人！');
-      session.finish();
+      let t = Buffer.alloc(0);
+      session.on('audio', (audio) => {
+        console.log('收到', audio.length, '字节');
+        t = Buffer.concat([t, audio]);
+      });
+
+      session.on('finished', () => {
+        console.log('TTS会话已结束。');
+        client.finishConnection();
+
+        const fs = require('fs');
+        fs.writeFileSync('tts.pcm', t);
+        console.log('音频数据已写入 tts.pcm，大小:', t.length);
+        console.log('要播放音频，请运行: ffplay -f s16le -ar 24000 -ac 1 tts.pcm');
+      });
+
+      session.on('sentence_start', (text) => {
+        console.log('句子开始', text);
+      });
+
+      session.on('sentence_end', (text) => {
+        console.log('句子结束', text);
+      });
+
+      session.on('error', (err) => {
+        console.error('TTS会话错误:', err);
+      });
+
+      session.on('cancelled', () => {
+        console.log('TTS会话已取消。');
+      });
+
+      session.on('finished', () => {
+        console.log('TTS会话已结束。');
+        client.finishConnection();
+      });
     });
 
-    let t = Buffer.alloc(0);
-    session.on('audio', (audio) => {
-      console.log(new Date(), 'received', audio.length, 'bytes')
-      t = Buffer.concat([t, audio]);
-    });
-
-    session.on('finished', () => {
-      console.log(new Date(), 'TTS session finished.');
-      tts.finishConnection();
-
-      const fs = require('fs');
-      fs.writeFileSync('tts.pcm', t);
-      console.log('Audio data written to tts.pcm, size:', t.length);
-      console.log('To play the audio, run: ffplay -f s16le -ar 24000 -ac 1 tts.pcm');
-    });
-  });
+    client.on('error', (err) => console.error('TTS客户端错误:', err));
+    client.on('close', () => console.log('TTS客户端已关闭'));
+  }
 }
 
+module.exports = { TtsClient };
+
 if (require.main === module) {
-  test();
-} else {
-  module.exports = { TtsClient };
+  TtsClient.test();
 }
